@@ -6,6 +6,7 @@
 #include "hw/pci/pci_device.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-dma.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "trace.h"
 #include "hcd-ohci.h"
@@ -22,12 +23,21 @@ struct OHCIPCIState {
     char *masterbus;
     uint32_t num_ports;
     uint32_t firstport;
+    qemu_irq irq_out[1];
 };
 
 static uint64_t nsc_usb_read(void *opaque, hwaddr addr, unsigned size)
 {
     return 0;
 }
+
+static void pc87560_usb_irq_relay(void *opaque, int n, int level)
+{
+    OHCIPCIState *ohci = opaque;
+    qemu_set_irq(ohci->irq_out[0], level);
+}
+
+
 // TODO look at the datasheet and write nsc code
 static void nsc_usb_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
@@ -76,9 +86,14 @@ static void usb_ohci_realize_pci(PCIDevice *dev, Error **errp)
     OHCIPCIState *ohci = NSC_PCI_OHCI(dev);
 
     dev->config[PCI_CLASS_PROG]    = 0x10;
+    dev->wmask[PCI_CLASS_PROG]     = 0xff;
     dev->config[PCI_INTERRUPT_PIN] = 0x04;
     dev->config[PCI_INTERRUPT_LINE] = 0x0b;
-
+    
+    qdev_init_gpio_out(DEVICE(dev), ohci->irq_out, 1);
+    // Wire OHCI's internal irq through the relay:
+    ohci->state.irq = qemu_allocate_irq(pc87560_usb_irq_relay, ohci, 0);    
+    
     usb_ohci_init(&ohci->state, DEVICE(dev), ohci->num_ports, 0,
                   ohci->masterbus, ohci->firstport,
                   pci_get_address_space(dev), ohci_pci_die, &err);
@@ -126,7 +141,7 @@ static void usb_ohci_reset_pci(DeviceState *d)
     OHCIState *s = &ohci->state;
 
     ohci_hard_reset(s);
-    dev->config[PCI_INTERRUPT_LINE] = 0x0b;
+    //dev->config[PCI_INTERRUPT_LINE] = 0x0b;
 }
 
 static const Property ohci_pci_properties[] = {

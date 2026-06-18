@@ -53,6 +53,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(PC87560SuperioState, PC87560_Superio)
 #define IC_PIC1  0x20
 #define IC_PIC2  0xA0
 
+typedef struct {
+    uint8_t imr;       /* interrupt mask register (OCW1) */
+    uint8_t irr;       /* interrupt request register    */
+    uint8_t isr;       /* in-service register           */
+    bool    poll_mode; /* OCW3 POLL bit set             */
+    bool    read_isr;  /* OCW3: true=ISR, false=IRR     */
+    int     init_phase;/* 0=normal, 1-3=ICW2/3/4 expected */
+    //qemu_irq parent_irq; /* the single wire to IOSAPIC  */
+} Pic8259;
+
 struct PC87560SuperioState {
     PCIDevice parent_obj;
 
@@ -80,6 +90,7 @@ struct PC87560SuperioState {
     bool kbc_mapped;
     bool acpi_mapped;
     bool pm_mapped;
+    Pic8259 pic;
 };
 
 #endif

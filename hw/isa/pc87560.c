@@ -14,7 +14,6 @@
 #include "hw/isa/pc87560.h"  
 
 
-
 static uint64_t pc87560_pp_read(void *opaque, hwaddr addr, unsigned size)
 {
     ParallelState *s = opaque;
@@ -28,6 +27,99 @@ static uint64_t pc87560_pp_read(void *opaque, hwaddr addr, unsigned size)
         return 0xFF;
     }
 }
+
+static void pic_update_irq(PC87560SuperioState *s)
+{
+    int pending = s->pic.irr & ~s->pic.imr & ~s->pic.isr;
+    pci_set_irq(PCI_DEVICE(s), pending != 0);
+}
+
+static uint64_t pic1_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PC87560SuperioState *s = opaque;
+    if (addr == 0) {
+        if (s->pic.poll_mode) {
+            /* OCW3 poll: return 0x80|IRQ# of highest pending unmasked */
+            s->pic.poll_mode = false;
+            uint8_t pending = s->pic.irr & ~s->pic.imr;
+            if (!pending) return 0x00;  /* bit7=0: no interrupt */
+            int irq = ctz32(pending);   /* lowest set bit */
+            s->pic.isr |= (1 << irq);
+            s->pic.irr &= ~(1 << irq);
+            return 0x80 | irq;
+        }
+        return s->pic.read_isr ? s->pic.isr : s->pic.irr;
+    }
+    return s->pic.imr; /* offset 1: IMR */
+}
+
+static void pic1_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    PC87560SuperioState *s = opaque;
+    uint8_t v = (uint8_t)val;
+
+    if (addr == 1) {  /* data port */
+        if (s->pic.init_phase > 0) {
+            /* absorb ICW2, ICW3, ICW4 — only ICW4 ends the sequence */
+            if (s->pic.init_phase == 3)  /* ICW4 received */
+                s->pic.init_phase = 0;
+            else
+                s->pic.init_phase++;
+        } else {
+            s->pic.imr = v;  /* OCW1: mask register */
+            pic_update_irq(s);
+        }
+        return;
+    }
+
+    /* addr == 0: command port */
+    if (v & 0x10) {
+        /* ICW1 — begin initialisation */
+        s->pic.init_phase = 1;
+        s->pic.imr = 0xFF;
+        s->pic.irr = 0;
+        s->pic.isr = 0;
+        s->pic.poll_mode = false;
+    } else if (v & 0x08) {
+        /* OCW3 */
+        if (v & 0x04) s->pic.poll_mode = true;
+        if (v & 0x02) s->pic.read_isr = (v & 0x01);
+    } else {
+        /* OCW2 — EOI variants; bits[7:5] encode command */
+        uint8_t cmd = (v >> 5) & 0x07;
+        uint8_t irq = v & 0x07;
+        switch (cmd) {
+        case 1: /* non-specific EOI */
+        case 5: /* rotate + non-specific EOI */
+            s->pic.isr &= s->pic.isr - 1;  /* clear lowest set bit */
+            break;
+        case 3: /* specific EOI (SEOI — what the driver uses) */
+        case 7: /* rotate + specific EOI */
+            s->pic.isr &= ~(1 << irq);
+            break;
+        }
+        pic_update_irq(s);
+    }
+}
+
+static const MemoryRegionOps pc87560_pic1_ops = {
+    .read  = pic1_read,
+    .write = pic1_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 1,
+};
+
+static void pc87560_pic_irq_in(void *opaque, int irq_n, int level)
+{
+    PC87560SuperioState *s = opaque;
+    if (level)
+        s->pic.irr |=  (1 << irq_n);
+    else
+        s->pic.irr &= ~(1 << irq_n);
+    pic_update_irq(s);
+}
+
 
 static void pc87560_pp_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
@@ -221,8 +313,8 @@ static void pc87560_superio_realize(PCIDevice *pci, Error **errp)
     MemoryRegion   *io = pci_address_space_io(pci);
     
     // multi function bit
-    pci->cap_present |= QEMU_PCI_CAP_MULTIFUNCTION;
-    pci->config[PCI_HEADER_TYPE] |= PCI_HEADER_TYPE_MULTI_FUNCTION;
+    //pci->cap_present |= QEMU_PCI_CAP_MULTIFUNCTION;
+    //pci->config[PCI_HEADER_TYPE] |= PCI_HEADER_TYPE_MULTI_FUNCTION;
 
     pci_set_word(pci->config + REG_FUNCEN,  FUNCEN_DEFAULT);
     pci->config[REG_RSVD_CFG]   = 0x01;
@@ -247,10 +339,25 @@ static void pc87560_superio_realize(PCIDevice *pci, Error **errp)
     pci_set_long(pci->wmask + REG_SP2BAR,  0xFFFFFFF8);
     pci_set_long(pci->wmask + REG_PPBAR,   0xFFFFFFF8);
 
-    pci->config[PCI_INTERRUPT_PIN] = 1;   // maybe comment this out 
-    s->irq = pci_allocate_irq(pci);       // cause its a bridge no irq 
+    //pci->config[PCI_INTERRUPT_PIN] = 1;   // maybe comment this out 
+    //s->irq = pci_allocate_irq(pci);       // cause its a bridge no irq 
+    //s->pic.parent_irq = pci_allocate_irq(pci);
+    pci->config[PCI_INTERRUPT_PIN] = 0x04; /* use INTD — matches USB slot */
 
-    s->serial[0].irq = s->irq;
+    /* Expose 8 GPIO inputs (PIC IRQ 0–7) */
+    qdev_init_gpio_in_named(DEVICE(pci), pc87560_pic_irq_in, "pic-irq", 8);
+
+    /* Register real PIC ops instead of stubs */
+    memory_region_init_io(&s->pic1_io, OBJECT(s), &pc87560_pic1_ops,
+                          s, "pc87560-pic1", 2);
+    memory_region_add_subregion(io, IC_PIC1, &s->pic1_io);
+    /* PIC2 still stub — driver inits it but the real chip cascades it to PIC1 */
+    
+    memory_region_init_io(&s->pic2_io, OBJECT(s), &pc87560_stub_ops,
+                          s, "pc87560-pic2", 2);
+    memory_region_add_subregion(io, IC_PIC2, &s->pic2_io);    
+    
+    s->serial[0].irq = qemu_allocate_irq(pc87560_pic_irq_in, s, 3);
     if (!qdev_realize(DEVICE(&s->serial[0]), NULL, errp)) {
         return;
     }
@@ -259,7 +366,7 @@ static void pc87560_superio_realize(PCIDevice *pci, Error **errp)
     memory_region_add_subregion(io, 0x3F8, &s->sp1_io);
     s->sp1_mapped = true;
 
-    s->serial[1].irq = s->irq;
+    s->serial[1].irq = qemu_allocate_irq(pc87560_pic_irq_in, s, 4);
     if (!qdev_realize(DEVICE(&s->serial[1]), NULL, errp)) {
         return;
     }
@@ -268,14 +375,14 @@ static void pc87560_superio_realize(PCIDevice *pci, Error **errp)
     memory_region_add_subregion(io, 0x2F8, &s->sp2_io);
     s->sp2_mapped = true;
 
-    s->pp.irq = s->irq;
+    s->pp.irq        = qemu_allocate_irq(pc87560_pic_irq_in, s, 5);
     memory_region_init_io(&s->pp_io, OBJECT(s), &pc87560_pp_ops,
                           &s->pp, "pc87560-pp", 8);
     memory_region_add_subregion(io, 0x378, &s->pp_io);
     s->pp_mapped = true;
 
 
-    s->fdc.irq       = s->irq;
+    s->fdc.irq       = qemu_allocate_irq(pc87560_pic_irq_in, s, 6);
     s->fdc.dma_chann = -1;
     s->fdc.dma       = NULL;
     s->fdc.fallback  = FLOPPY_DRIVE_TYPE_144;
@@ -301,13 +408,13 @@ static void pc87560_superio_realize(PCIDevice *pci, Error **errp)
     memory_region_init_io(&s->pm_io, OBJECT(s), &pc87560_stub_ops,
                           s, "pc87560-pm", 256);
 
-    memory_region_init_io(&s->pic1_io, OBJECT(s), &pc87560_stub_ops,
-                          s, "pc87560-pic1", 2);
-    memory_region_add_subregion(io, IC_PIC1, &s->pic1_io);
+    //memory_region_init_io(&s->pic1_io, OBJECT(s), &pc87560_stub_ops,
+    //                      s, "pc87560-pic1", 2);
+    //memory_region_add_subregion(io, IC_PIC1, &s->pic1_io);
 
-    memory_region_init_io(&s->pic2_io, OBJECT(s), &pc87560_stub_ops,
-                          s, "pc87560-pic2", 2);
-    memory_region_add_subregion(io, IC_PIC2, &s->pic2_io);
+    //memory_region_init_io(&s->pic2_io, OBJECT(s), &pc87560_stub_ops,
+    //                      s, "pc87560-pic2", 2);
+    //memory_region_add_subregion(io, IC_PIC2, &s->pic2_io);
 
 }
 

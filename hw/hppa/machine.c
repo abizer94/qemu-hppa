@@ -719,7 +719,7 @@ static void machine_HP_B160L_init(MachineState *machine)
         dev = DEVICE(pci_create_simple(pci_bus, -1, "lsi53c895a"));
         lsi53c8xx_handle_legacy_cmdline(dev);
     }
-
+	
     /* Add NICs, graphics & load firmware */
     machine_HP_common_init_tail(machine, pci_bus, translate);
 }
@@ -748,16 +748,13 @@ static void machine_HP_C3700_init(MachineState *machine)
     MemoryRegion *addr_space = get_system_memory();
     TranslateFn *translate;
 
-    /* Create CPUs and RAM.  */
     translate = machine_HP_common_init_cpus(machine);
-
     if (!hppa_is_pa20(&cpu[0]->env)) {
         error_report("The HP C3000 workstation requires a 64-bit CPU. "
                      "Use '-machine B160L' instead.");
         exit(1);
     }
 
-    /* Init Astro and the Elroys (PCI host bus chips).  */
     astro = astro_init();
     astro_dev = DEVICE(astro);
     memory_region_add_subregion(addr_space, translate(NULL, ASTRO_HPA),
@@ -766,13 +763,45 @@ static void machine_HP_C3700_init(MachineState *machine)
     pci_bus = PCI_BUS(qdev_get_child_bus(DEVICE(astro->elroy[0]), "pci"));
     assert(pci_bus);
 
-    /* SCSI disk setup. */
+    /* IDE and USB need no chardev, pci_create_simple is fine */
+    PCIDevice *ide_pdev = pci_create_simple(pci_bus, PCI_DEVFN(3, 0), "pc87560-ide");
+    PCIDevice *usb_pdev = pci_create_simple(pci_bus, PCI_DEVFN(3, 2), "pc87560-ohci");
+
+    /*
+     * SuperIO: use pci_new so we can attach chardevs BEFORE realize.
+     * This MUST happen before machine_HP_common_init_tail(), because
+     * that function claims serial_hd(0) for the HP serial card (slot 2,
+     * 103c:1048), leaving ttyS0 with no backend and silencing the console
+     * the instant bootcon is disabled.
+     *
+     * With this change: serial_hd(0) → SuperIO SP1 (ttyS0, 0x3f8)
+     *                   serial_hd(1) → SuperIO SP2 (ttyS1, 0x2f8)
+     * The HP card then gets no chardev (it becomes ttyS2-4 in the kernel
+     * but isn't connected to any terminal, which is fine).
+     */
+    PCIDevice *sio_pdev = pci_new(PCI_DEVFN(3, 1), "pc87560-superio");
+    if (serial_hd(0)) {
+        qdev_prop_set_chr(DEVICE(sio_pdev), "serial0", serial_hd(0));
+    }
+    if (serial_hd(1)) {
+        qdev_prop_set_chr(DEVICE(sio_pdev), "serial1", serial_hd(1));
+    }
+    pci_realize_and_unref(sio_pdev, pci_bus, &error_fatal);
+
+    /* Wire IDE and USB interrupt outputs into the SuperIO 8259 PIC */
+    qdev_connect_gpio_out(DEVICE(ide_pdev), 0,
+        qdev_get_gpio_in_named(DEVICE(sio_pdev), "pic-irq", 7));
+    qdev_connect_gpio_out(DEVICE(usb_pdev), 0,
+        qdev_get_gpio_in_named(DEVICE(sio_pdev), "pic-irq", 1));
+
+    /* SCSI */
     if (drive_get_max_bus(IF_SCSI) >= 0) {
         DeviceState *dev = DEVICE(pci_create_simple(pci_bus, -1, "lsi53c895a"));
         lsi53c8xx_handle_legacy_cmdline(dev);
     }
 
-    /* Add NICs, graphics & load firmware */
+    /* NICs, graphics, HP serial card, firmware — comes last so it gets
+     * whatever serial_hd() slots remain after SuperIO takes the first two */
     machine_HP_common_init_tail(machine, pci_bus, translate);
 }
 
