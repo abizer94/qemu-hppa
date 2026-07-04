@@ -8,12 +8,20 @@
 #include "ide-internal.h"
 #include "trace.h"
 
-#define do_debugstuff 0
+#define PC87560_IDE_DEBUG 1
+ 
+#define DPRINTF(fmt, ...) \
+    do { \
+        if (PC87560_IDE_DEBUG) { \
+            fprintf(stderr, fmt, ## __VA_ARGS__); \
+        } \
+    } while (0)
 
 #define IDE_CFR1 0x40
 #define IDE_CFR2 0x41 
 #define IDE_CFR3 0x42 
 #define IDE_WBS 0x43 
+
 
 /* PC87560 Bus Master IDE Command Register bits (BAR4 offset 0x00/0x08) */
 #define PC87560_BM_CMD_START        0x01  /* bit 0: start/stop DMA */
@@ -36,6 +44,7 @@
 #define ATA_DMA_ACTIVE  0x01
 
 static qemu_irq pc87560_ide_irq_out;
+static void pc87560_update_irq(PCIDevice *pd);
 
 static uint64_t bmdma_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -57,48 +66,35 @@ static uint64_t bmdma_read(void *opaque, hwaddr addr, unsigned size)
         val = 0xff;
         break;
     }
-    if (do_debugstuff){
-        fprintf(stderr, "[IDE] BMDMA READ  addr=0x%" HWADDR_PRIx
-                " val=0x%02x cmd=0x%02x status=0x%02x\n",
-                addr, val, bm->cmd, bm->status);
-    }
     return val;
 }
 
 static void bmdma_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     BMDMAState *bm = opaque;
-    
-    if (do_debugstuff){
-        fprintf(stderr, "[IDE] BMDMA WRITE addr=0x%" HWADDR_PRIx
-                " val=0x%" PRIx64 " size=%d cmd=0x%02x status=0x%02x\n",
-                addr, val, size, bm->cmd, bm->status);
-    }
+    PCIDevice *pd = PCI_DEVICE(bm->bus->qbus.parent);
+
     if (size != 1) {
         return;
     }
 
     switch (addr & 3) {
-    case 0:
-        bmdma_cmd_writeb(bm, val);
-    /* PC87560/NS87415 erratum: writing CMD also clears status
-     * bits 1 (ERR) and 2 (INTR), per pata_ns87415.c ns87415_irq_clear().
-     * Real silicon ties these together; generic bmdma_cmd_writeb()
-     * does not know this, so we replicate it here. */
-        if (val & (ATA_DMA_INTR | ATA_DMA_ERR)) {
-            bm->status &= ~(val & (ATA_DMA_INTR | ATA_DMA_ERR));
-        }
-        if (do_debugstuff){
-            fprintf(stderr, "[IDE] BMDMA CMD after: cmd=0x%02x status=0x%02x\n",
-                    bm->cmd, bm->status);
-        }
-        break;
+    case 0: {
+    	uint8_t status_clear = val & (ATA_DMA_INTR | ATA_DMA_ERR);
+    	uint8_t real_cmd = val & 0x09;  /* only START(0) and WRITE(3) are real cmd bits */
+
+    	bm->status &= ~status_clear;
+    
+    	if (real_cmd != (bm->cmd & 0x09)) {
+        	bmdma_cmd_writeb(bm, real_cmd);
+    	}
+
+    	pc87560_update_irq(pd);
+    	break;
+    }
     case 2:
         bmdma_status_writeb(bm, val);
-        if (do_debugstuff){
-            fprintf(stderr, "[IDE] BMDMA STATUS after: status=0x%02x\n",
-                    bm->status);
-        }
+        pc87560_update_irq(pd);
         break;
     default:
         break;
@@ -110,18 +106,15 @@ static void pc87560_update_irq(PCIDevice *pd)
     PCIIDEState *d = PCI_IDE(pd);
     uint8_t cntrl2 = pd->config[IDE_CFR2];
     int level = 0;
-
+    
     if (!(cntrl2 & CFR_INTR_CH1)) {
         level |= !!(d->bmdma[0].status & BM_STATUS_INT);
     }
     if (!(cntrl2 & CFR_INTR_CH2)) {
         level |= !!(d->bmdma[1].status & BM_STATUS_INT);
     }
-
     qemu_set_irq(pc87560_ide_irq_out, level);
-    
 }
-
 
 
 static const MemoryRegionOps pc87560_bmdma_ops = {
@@ -153,14 +146,10 @@ static void pc87560_set_irq(void *opaque, int channel, int level)
 {
     PCIIDEState *d = opaque;
     PCIDevice *pd = PCI_DEVICE(d);
-
-    // Only SET the interrupt bit on a rising edge (level == 1)
+    
     if (level) {
         d->bmdma[channel].status |= BM_STATUS_INT;
     }
-    // Do NOT clear it on level == 0. 
-    // The guest OS will clear it via bmdma_write -> bmdma_status_writeb
-
     pc87560_update_irq(pd);
 }
 
@@ -180,16 +169,6 @@ static void pc87560_pci_config_write(PCIDevice *d, uint32_t addr, uint32_t val,
                                     int l)
 {
     uint32_t i;
-    PCIIDEState *idedev = PCI_IDE(d);
-    for (i = 0; i < 2; i++) {
-        if (do_debugstuff){
-            fprintf(stderr, "[IDE] realize done: bus[%d] bmdma=%p"
-                    " ifs[0].blk=%p ifs[1].blk=%p\n",
-                    i, &idedev->bmdma[i],
-                    idedev->bus[i].ifs[0].blk,
-                    idedev->bus[i].ifs[1].blk);
-        }
-    }
     pci_default_write_config(d, addr, val, l);
 
     for (i = addr; i < addr + l; i++) {
@@ -201,7 +180,6 @@ static void pc87560_pci_config_write(PCIDevice *d, uint32_t addr, uint32_t val,
     }
 }
 
-/* pc87560 PCI IDE controller */
 static void pci_pc87560_ide_realize(PCIDevice *dev, Error **errp)
 {
     
@@ -213,13 +191,10 @@ static void pci_pc87560_ide_realize(PCIDevice *dev, Error **errp)
     dev->cap_present |= QEMU_PCI_CAP_MULTIFUNCTION;
     pci_conf[PCI_HEADER_TYPE] |= PCI_HEADER_TYPE_MULTI_FUNCTION;
     
-    
-    
     pci_conf[PCI_CLASS_PROG] = 0x8a;
-    
     dev->wmask[PCI_CLASS_PROG] = 0xff;
     
-    pci_conf[PCI_INTERRUPT_PIN] = 0x00;
+    pci_conf[PCI_INTERRUPT_PIN] = 0x01;
     qdev_init_gpio_out(ds, &pc87560_ide_irq_out, 1);
     
     
@@ -282,18 +257,6 @@ static void pci_pc87560_ide_realize(PCIDevice *dev, Error **errp)
         d->bmdma[i].bus = &d->bus[i];
         ide_bus_register_restart_cb(&d->bus[i]);
     }
-    
-    /* debug: print drive attachment state after realize */
-    for (i = 0; i < 2; i++) {
-        if (do_debugstuff){
-            fprintf(stderr, "[IDE] realize done: bus[%d] bmdma=%p"
-                    " ifs[0].blk=%p ifs[1].blk=%p\n",
-                    i, &d->bmdma[i],
-                    d->bus[i].ifs[0].blk,
-                    d->bus[i].ifs[1].blk);
-        }
-    }
-    
 }
 
 static void pci_pc87560_ide_exitfn(PCIDevice *dev)
@@ -328,6 +291,7 @@ static void pc87560_ide_class_init(ObjectClass *klass, const void *data)
     k->config_write = pc87560_pci_config_write;
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
 }
+
 
 static const TypeInfo pc87560_ide_info = {
     .name          = "pc87560-ide",

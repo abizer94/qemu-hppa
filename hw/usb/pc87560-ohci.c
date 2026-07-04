@@ -64,34 +64,25 @@ static void ohci_pci_die(struct OHCIState *ohci)
 static uint32_t pc87560_ohci_config_read(PCIDevice *pci, uint32_t addr, int len)
 {
     uint32_t val = pci_default_read_config(pci, addr, len);
-    fprintf(stderr, "[OHCI] CFG READ  addr=0x%02x len=%d -> 0x%x%s%s\n",
-            addr, len, val,
-            (addr == 0x00) ? " [vendor+device]" : "",
-            (addr == 0x06) ? " [STATUS]"        : "");
     return val;
 }
 
 static void pc87560_ohci_config_write(PCIDevice *pci, uint32_t addr,
                                        uint32_t val, int len)
 {
-    fprintf(stderr, "[OHCI] CFG WRITE addr=0x%02x val=0x%x len=%d\n",
-            addr, val, len);
     pci_default_write_config(pci, addr, val, len);
 }
 
 static void usb_ohci_realize_pci(PCIDevice *dev, Error **errp)
 {
-    fprintf(stderr, "pc87560-ohci: realize called, devfn=0x%x\n", dev->devfn);
     Error *err = NULL;
     OHCIPCIState *ohci = NSC_PCI_OHCI(dev);
-
+    
     dev->config[PCI_CLASS_PROG]    = 0x10;
     dev->wmask[PCI_CLASS_PROG]     = 0xff;
-    dev->config[PCI_INTERRUPT_PIN] = 0x04;
-    dev->config[PCI_INTERRUPT_LINE] = 0x0b;
-    
+    dev->config[PCI_INTERRUPT_PIN] = 0x01; 
+   
     qdev_init_gpio_out(DEVICE(dev), ohci->irq_out, 1);
-    // Wire OHCI's internal irq through the relay:
     ohci->state.irq = qemu_allocate_irq(pc87560_usb_irq_relay, ohci, 0);    
     
     usb_ohci_init(&ohci->state, DEVICE(dev), ohci->num_ports, 0,
@@ -101,8 +92,6 @@ static void usb_ohci_realize_pci(PCIDevice *dev, Error **errp)
         error_propagate(errp, err);
         return;
     }
-
-    ohci->state.irq = pci_allocate_irq(dev);
 
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &ohci->state.mem);
 
@@ -141,7 +130,6 @@ static void usb_ohci_reset_pci(DeviceState *d)
     OHCIState *s = &ohci->state;
 
     ohci_hard_reset(s);
-    //dev->config[PCI_INTERRUPT_LINE] = 0x0b;
 }
 
 static const Property ohci_pci_properties[] = {
