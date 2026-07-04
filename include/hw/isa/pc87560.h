@@ -60,13 +60,17 @@ typedef struct {
     bool    poll_mode; /* OCW3 POLL bit set             */
     bool    read_isr;  /* OCW3: true=ISR, false=IRR     */
     int     init_phase;/* 0=normal, 1-3=ICW2/3/4 expected */
+    int     priority_base;
+    int     irq_level; 
     //qemu_irq parent_irq; /* the single wire to IOSAPIC  */
 } Pic8259;
 
 struct PC87560SuperioState {
     PCIDevice parent_obj;
 
-    qemu_irq irq;
+    qemu_irq irq;// you only need one
+    qemu_irq parent_irq; 
+    //qemu_irq elroy_direct; 
 
     SerialState   serial[2];
     ParallelState pp;
