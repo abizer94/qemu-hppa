@@ -371,6 +371,8 @@ void ohci_hard_reset(OHCIState *ohci)
     ohci_soft_reset(ohci);
     ohci->ctl = 0;
     ohci_roothub_reset(ohci);
+    ohci->big_endian = false;
+    ohci->consistency_check = false;
 }
 
 /* Get an array of dwords from main memory */
@@ -867,6 +869,18 @@ static void ohci_td_pkt(const char *msg, const uint8_t *buf, size_t len)
     }
 }
 
+static void ohci_bswap_buf(uint8_t *buf, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i + 4 <= len; i += 4) {
+        uint32_t w;
+        memcpy(&w, buf + i, 4);
+        w = bswap32(w);
+        memcpy(buf + i, &w, 4);
+    }
+}
+
 /*
  * Service a transport descriptor.
  * Returns nonzero to terminate processing of this endpoint.
@@ -886,6 +900,11 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
     int flag_r;
     int completion;
 
+    if (ohci->consistency_check && (ed->head & 0xc)) {
+        ohci_die(ohci);
+        return 1;
+    }
+    
     addr = ed->head & OHCI_DPTR_MASK;
     if (addr == 0) {
         ohci_die(ohci);
@@ -975,6 +994,9 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
                                  DMA_DIRECTION_TO_DEVICE)) {
                     ohci_die(ohci);
                 }
+                if (ohci->big_endian) {
+                    ohci_bswap_buf(ohci->usb_buf, pktlen);
+                }
             }
         }
     }
@@ -1024,6 +1046,9 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
 
     if (ret >= 0) {
         if (dir == OHCI_TD_DIR_IN) {
+            if (ohci->big_endian) {
+                ohci_bswap_buf(ohci->usb_buf, ret);
+            }
             if (ohci_copy_td(ohci, &td, ohci->usb_buf, ret,
                              DMA_DIRECTION_FROM_DEVICE)) {
                 ohci_die(ohci);
@@ -1108,13 +1133,19 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
         ohci->done_count = i;
     }
 exit_no_retire:
+    if (ohci->media_error) {
+        int cc = OHCI_BM(td.flags, TD_CC);
+        // only these 2 errors will ever actually be possible in qemu
+        if (cc == OHCI_CC_DEVICENOTRESPONDING || cc == OHCI_CC_UNDEXPETEDPID) {
+            ohci->media_error(ohci);
+        }
+    }
     if (ohci_put_td(ohci, addr, &td)) {
         ohci_die(ohci);
         return 1;
     }
     return OHCI_BM(td.flags, TD_CC) != OHCI_CC_NOERROR;
 }
-
 /* Service an endpoint list.  Returns nonzero if active TD were found. */
 static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
 {
